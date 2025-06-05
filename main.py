@@ -1,10 +1,9 @@
-import random
+import zmq
 
-# In-memory storage for user accounts and activity
-users = {}
+# Global variables
 current_user = None
+current_user_genre = None
 user_activity = {}
-discovered_songs = {}  # Tracks discovered songs by user
 
 # Sample data for popular songs, albums, and genre-based recommendations
 popular_songs = ["Love Somebody - Morgan Wallen", "A Bar Song(Tipsy) - Shaboozey", "Birds of a Feather - Billie Eilish", "Die With A Smile - Lady Gaga & Bruno Mars", "Espresso - Sabrina Carpenter"]
@@ -26,45 +25,103 @@ recommended_songs_by_genre = {
 # Predefined list of genres
 genres = list(recommended_songs_by_genre.keys())
 
+def send_request_to_login_service(request):
+    """
+    Send a request to the login service (auth_service_login.py).
+    """
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.connect("tcp://localhost:5557")  # Login service port
+    socket.send_json(request)
+    response = socket.recv_json()
+    return response
+
+def send_request_to_activity_service(request):
+    """
+    Send a request to the activity service (auth_service_activity.py).
+    """
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.connect("tcp://localhost:5558")  # Activity service port
+    socket.send_json(request)
+    response = socket.recv_json()
+    return response
+
+# Function for sending requests to the auth service
+def send_auth_request(request):
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.connect("tcp://localhost:5557")  # Port where auth_service is running
+
+    socket.send_json(request)
+    response = socket.recv_json()
+    return response
+
 def discover_new_music():
-    favorite_genre = users[current_user]["favorite_genre"]
-    recommended_songs = recommended_songs_by_genre.get(favorite_genre, [])
-    
-    # Ensure there is a discovered_songs entry for the current user
-    if current_user not in discovered_songs:
-        discovered_songs[current_user] = set()
-    
-    # Filter out songs already discovered by this user
-    new_songs = [song for song in recommended_songs if song not in discovered_songs[current_user]]
-    
-    if new_songs:
-        # Randomly select a new song that hasn't been recommended before
-        new_song = random.choice(new_songs)
-        print(f"\nDiscovering new music in your favorite genre ({favorite_genre}): {new_song}")
-        
-        # Add the discovered song to the user's discovered songs list
-        discovered_songs[current_user].add(new_song)
-        
-        # Ask if the user wants to rate the discovered song
-        rate_choice = input("Would you like to rate this song? (y/n): ")
-        if rate_choice.lower() == 'y':
-            while True:
-                try:
-                    rating = float(input("Enter your rating (1-5, decimals allowed): "))
-                    if 1 <= rating <= 5:
-                        user_activity.setdefault(current_user, []).append(f"Discovered and rated - {new_song} - {rating}/5")
-                        print(f"You rated '{new_song}' with a {rating}/5.")
-                        break
+    global current_user, current_user_genre
+    if not current_user:
+        print("Log in to discover new music.")
+        return
+
+    if not current_user_genre:
+        print("Favorite genre is not available. Please log in again.")
+        return
+
+    print(f"Debug: Current user: {current_user}, Favorite genre: {current_user_genre}")
+
+    # Set up ZeroMQ REQ socket to send a request to the recommender microservice
+    ctx = zmq.Context()
+    socket = ctx.socket(zmq.REQ)
+    socket.connect("tcp://localhost:5555")  # Port where the recommender service listens
+
+    # Prepare the request
+    request = {"type": "music", "genre": current_user_genre.lower()}
+    print(f"Debug: Sending request: {request}")
+    socket.send_json(request)
+
+    # Wait for an immediate response (acknowledgment)
+    try:
+        response = socket.recv_json(flags=zmq.NOBLOCK)
+        print(f"Debug: Immediate response received: {response}")
+    except zmq.Again:
+        print("Debug: No immediate response. Subscribing for updates.")
+
+    # Set up a subscriber to listen for recommendations
+    subscriber = ctx.socket(zmq.SUB)
+    subscriber.connect("tcp://localhost:5556")  # Port where recommendations are broadcasted
+    subscriber.setsockopt_string(zmq.SUBSCRIBE, "recommendation")
+
+    print("Waiting for recommendations...")
+
+    for _ in range(5):  # Attempt to retrieve recommendations 5 times
+        if subscriber.poll(1000):  # Wait for a message for 1 second
+            try:
+                topic = subscriber.recv_string()
+                response = subscriber.recv_json()
+                print(f"Debug: Received topic: {topic}, Data: {response}")
+
+                if topic == "recommendation":
+                    titles = response.get("titles", [])
+                    if titles:
+                        print("\nDiscovered New Music Recommendations:")
+                        for idx, title in enumerate(titles, start=1):
+                            song_name = title.get('name', 'Unknown Song')
+                            artist_name = title.get('artists', [{}])[0].get('name', 'Unknown Artist')
+                            print(f"{idx}. {song_name} by {artist_name}")
+
+                            # Log discovered songs in user activity
+                            user_activity.setdefault(current_user, []).append(f"Discovered - {song_name} by {artist_name}")
+                        return
                     else:
-                        print("Please enter a rating between 1 and 5.")
-                except ValueError:
-                    print("Invalid input. Please enter a number between 1 and 5.")
+                        print("No recommendations found.")
+                        return
+            except Exception as e:
+                print(f"Debug: Error receiving recommendation: {e}")
         else:
-            # Log the discovered song without a rating
-            user_activity.setdefault(current_user, []).append(f"Discovered new song - {new_song}")
-            print("You chose not to rate the song.")
-    else:
-        print(f"\nNo new songs to discover in {favorite_genre}. You've discovered all available songs in this genre!")
+            print("Debug: No recommendations received yet...")
+
+    print("Unable to discover new music. Please try again later.")
+
 
 def display_startup_message():
     print("Welcome to MusicBoxd—your go-to platform for sharing opinions on songs, artists, and genres!")
@@ -85,28 +142,95 @@ def main_menu():
     print("5. Exit")
     print("\n* Choose an option to explore various features, like discovering music or viewing popular songs.")
 
+def send_request_to_playlist_service(request):
+    """
+    Send a request to the playlist microservice.
+    """
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.connect("tcp://localhost:5559")  # Playlist service port
+    socket.send_json(request)
+    response = socket.recv_json()
+    return response
+
+def manage_playlists():
+    """
+    Manage playlists by adding, viewing, or deleting playlists and songs.
+    """
+    while True:
+        print("\nPlaylist Management:")
+        print("1. View Playlists")
+        print("2. Create a Playlist")
+        print("3. Add Song to a Playlist")
+        print("4. Remove Song from a Playlist")
+        print("5. Delete a Playlist")
+        print("6. Back to Main Menu")
+
+        choice = input("Enter your choice: ")
+
+        if choice == '1':
+            request = {"type": "view_playlists", "username": current_user}
+            response = send_request_to_playlist_service(request)
+            if response["success"]:
+                playlists = response.get("playlists", {})
+                if playlists:
+                    print("\nYour Playlists:")
+                    for playlist, songs in playlists.items():
+                        print(f"- {playlist}: {', '.join(songs) if songs else 'No songs'}")
+                else:
+                    print("You have no playlists.")
+            else:
+                print(response["message"])
+
+        elif choice == '2':
+            playlist_name = input("Enter the name of the new playlist: ")
+            request = {"type": "create_playlist", "username": current_user, "playlist_name": playlist_name}
+            response = send_request_to_playlist_service(request)
+            print(response["message"])
+
+        elif choice == '3':
+            playlist_name = input("Enter the name of the playlist: ")
+            song = input("Enter the name of the song to add: ")
+            request = {"type": "add_song", "username": current_user, "playlist_name": playlist_name, "song": song}
+            response = send_request_to_playlist_service(request)
+            print(response["message"])
+
+        elif choice == '4':
+            playlist_name = input("Enter the name of the playlist: ")
+            song = input("Enter the name of the song to remove: ")
+            request = {"type": "remove_song", "username": current_user, "playlist_name": playlist_name, "song": song}
+            response = send_request_to_playlist_service(request)
+            print(response["message"])
+
+        elif choice == '5':
+            playlist_name = input("Enter the name of the playlist to delete: ")
+            request = {"type": "delete_playlist", "username": current_user, "playlist_name": playlist_name}
+            response = send_request_to_playlist_service(request)
+            print(response["message"])
+
+        elif choice == '6':
+            break
+        else:
+            print("Invalid choice. Please try again.")
+
 def logged_in_menu():
     print("\nLogged-In Menu:")
     print("1. Play and Rate - play a song, rate it, or discover new songs based on your favorite genre")
     print("2. Change Favorite Genre - update your musical preferences")
     print("3. Show Recent Activity - review your recent actions and ratings")
     print("4. View Current Favorite Genre - check your current preferred genre")
-    print("5. Logout")
-    print("6. Exit")
+    print("5. Manage Playlists - create and manage playlists")
+    print("6. Logout")
+    print("7. Exit")
 
 def create_account():
-    global users
-    print("Creating an account will allow you to log in, rate songs, and customize your experience.")
     username = input("Enter a username: ")
-    if username in users:
-        print("Username already exists. Please choose a different username.")
-        return
     password = input("Enter a password: ")
     
     print("\nAvailable Genres:")
     for index, genre in enumerate(genres, start=1):
         print(f"{index}. {genre}")
-    
+
     while True:
         try:
             genre_choice = int(input("Enter the number of your favorite genre: "))
@@ -117,20 +241,36 @@ def create_account():
                 print("Invalid choice. Please choose a number from the list.")
         except ValueError:
             print("Invalid input. Please enter a number.")
-    
-    users[username] = {"password": password, "favorite_genre": favorite_genre}
-    print("Account created successfully! Log in to start exploring music.")
+
+    request = {
+        "type": "register",
+        "username": username,
+        "password": password,
+        "favorite_genre": favorite_genre
+    }
+    response = send_auth_request(request)
+    print(response["message"])
 
 def login():
-    global current_user, users
-    print("Logging in lets you save preferences, see recent activity, and more.")
+    global current_user, current_user_genre
     username = input("Enter your username: ")
     password = input("Enter your password: ")
-    if username in users and users[username]["password"] == password:
+
+    request = {
+        "type": "login",
+        "username": username,
+        "password": password
+    }
+    response = send_request_to_login_service(request)  # Ensure this sends to login service
+
+    if response["success"]:
         current_user = username
-        display_welcome_back_message()
+        current_user_genre = response["favorite_genre"]  # Store the favorite genre locally
+        print("Login successful!")
+        print(f"Welcome back! Your favorite genre is {current_user_genre}.")
     else:
-        print("Invalid username or password.")
+        print(response["message"])
+
 
 def logout():
     global current_user
@@ -165,7 +305,19 @@ def play_and_rate():
             try:
                 rating = float(input("Enter your rating (1-5, decimals allowed): "))
                 if 1 <= rating <= 5:
-                    user_activity.setdefault(current_user, []).append(f"Played and rated {song} with a {rating}/5")
+                    # Log the activity (played and rated the song)
+                    activity = f"Played and rated {song} with a {rating}/5"
+                    
+                    # Send activity to auth_service.py for logging
+                    request = {
+                        "type": "add_activity",
+                        "username": current_user,
+                        "activity": activity
+                    }
+                    send_auth_request(request)  # Log activity in the auth service
+
+                    # Store the activity in in-memory user_activity if needed
+                    user_activity.setdefault(current_user, []).append(activity)
                     print(f"You played '{song}' and rated it {rating}/5.")
                     break
                 else:
@@ -178,6 +330,22 @@ def play_and_rate():
     else:
         print("Invalid choice. Please try again.")
 
+def show_recent_activity():
+    print("\nRecent Activity:")
+    request = {
+        "type": "get_activity",
+        "username": current_user
+    }
+    response = send_request_to_activity_service(request)
+
+    if response["success"]:
+        activities = response["activities"]
+        for index, activity in enumerate(activities, start=1):
+            print(f"{index}. {activity[0]} at {activity[1]}")
+    else:
+        print("No recent activity.")
+
+
 def change_favorite_genre():
     print("\nAvailable Genres:")
     for index, genre in enumerate(genres, start=1):
@@ -187,7 +355,12 @@ def change_favorite_genre():
         try:
             genre_choice = int(input("Enter the number of your new favorite genre: "))
             if 1 <= genre_choice <= len(genres):
-                users[current_user]["favorite_genre"] = genres[genre_choice - 1]
+                request = {
+                    "type": "update_genre",
+                    "username": current_user,
+                    "new_genre": genres[genre_choice - 1]
+                }
+                response = send_auth_request(request)
                 print(f"Favorite genre changed to {genres[genre_choice - 1]}.")
                 break
             else:
@@ -195,55 +368,31 @@ def change_favorite_genre():
         except ValueError:
             print("Invalid input. Please enter a number.")
 
-def show_recent_activity():
-    print("\nRecent Activity:")
-    activities = user_activity.get(current_user, [])
-    
-    # Check if there are activities to display
-    if not activities:
-        print("No recent activity.")
-    else:
-        # Display only the 5 most recent activities by default
-        recent_activities = activities[-5:]  # Get the last 5 activities
-        
-        for index, activity in enumerate(recent_activities, start=1):
-            print(f"{index}. {activity}")
-        
-        # Option to show all activities if there are more than 5
-        if len(activities) > 5:
-            show_all_choice = input("Would you like to see all recent activity? (y/n): ")
-            if show_all_choice.lower() == 'y':
-                print("\nAll Recent Activity:")
-                for index, activity in enumerate(activities, start=1):
-                    print(f"{index}. {activity}")
-        
-        # Option to delete a rating
-        delete_choice = input("Would you like to delete a rating? (y/n): ")
-        if delete_choice.lower() == 'y':
-            try:
-                delete_index = int(input("Enter the number of the activity you want to delete: ")) - 1
-                
-                # Adjust delete_index based on whether all or only 5 activities were shown
-                if len(activities) > 5 and show_all_choice.lower() != 'y':
-                    delete_index += len(activities) - 5
-                
-                # Check if the index is valid
-                if 0 <= delete_index < len(activities):
-                    deleted_activity = activities.pop(delete_index)
-                    print(f"Deleted: {deleted_activity}")
-                else:
-                    print("Invalid choice. No activity deleted.")
-            except ValueError:
-                print("Invalid input. Please enter a number.")
-
-
 def view_current_favorite_genre():
-    print(f"\nYour current favorite genre is: {users[current_user]['favorite_genre']}")
+    """
+    Fetch and display the user's favorite genre using the activity service.
+    """
+    global current_user
+    if not current_user:
+        print("You need to log in to view your favorite genre.")
+        return
+
+    # Send request to the activity service
+    request = {
+        "type": "get_favorite_genre",
+        "username": current_user
+    }
+    response = send_request_to_activity_service(request)
+
+    if response["success"]:
+        print(f"\nYour current favorite genre is: {response['favorite_genre']}")
+    else:
+        print(response["message"])
 
 def main():
     global current_user
     display_startup_message()  # Show startup message at program start
-    
+
     while True:
         if current_user is None:
             main_menu()
@@ -262,26 +411,31 @@ def main():
                 break
             else:
                 print("Invalid choice. Please try again.")
-
         else:
-            logged_in_menu()
-            choice = input("Enter your choice: ")
+            # Once logged in, display the logged-in menu
+            while current_user:
+                logged_in_menu()
+                choice = input("Enter your choice: ")
 
-            if choice == '1':
-                play_and_rate()
-            elif choice == '2':
-                change_favorite_genre()
-            elif choice == '3':
-                show_recent_activity()
-            elif choice == '4':
-                view_current_favorite_genre()
-            elif choice == '5':
-                logout()
-            elif choice == '6':
-                print("Exiting the program. Goodbye!")
-                break
-            else:
-                print("Invalid choice. Please try again.")
+                if choice == '1':
+                    play_and_rate()
+                elif choice == '2':
+                    change_favorite_genre()
+                elif choice == '3':
+                    show_recent_activity()
+                elif choice == '4':
+                    view_current_favorite_genre()
+                elif choice == '5':
+                    manage_playlists()
+                elif choice == '6':
+                    logout()
+                    break  # Return to main menu after logout
+                elif choice == '7':
+                    print("Exiting the program. Goodbye!")
+                    exit()  # Terminate the program
+                else:
+                    print("Invalid choice. Please try again.")
+
 
 if __name__ == "__main__":
     main()
